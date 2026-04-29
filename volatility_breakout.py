@@ -38,6 +38,12 @@ INITIAL_CAPITAL = 10_000_000
 BUY_COST = 0.00015      # 0.015%
 SELL_COST = 0.00195     # 0.195% (수수료 + 세금)
 SLIPPAGE = 0.001        # 0.1%
+
+# Enhanced 전략 파라미터
+MA_WINDOW = 5           # 5일 이동평균 추세 필터
+TAKE_PROFIT = 0.05      # +5% 익절
+STOP_LOSS = 0.03        # −3% 손절
+
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 
@@ -159,6 +165,77 @@ def run_breakout(df: pd.DataFrame, k: float, capital: float) -> dict:
     }
 
 
+def run_breakout_enhanced(
+    df: pd.DataFrame,
+    k: float,
+    capital: float,
+    ma_window: int = MA_WINDOW,
+    take_profit: float = TAKE_PROFIT,
+    stop_loss: float = STOP_LOSS,
+) -> dict:
+    """추세 필터 + 익절/손절이 적용된 변동성 돌파 전략.
+
+    매수 조건 (모두 충족해야 진입):
+        ① 당일 고가 ≥ 매수 기준가 (기존 변동성 돌파)
+        ② 당일 시가 ≥ 직전 ma_window일 종가 이동평균 (상승 추세 필터)
+
+    청산 우선순위:
+        ③ 당일 저가 ≤ 손절가(target × (1-stop_loss)) → 손절가 매도
+        ④ 당일 고가 ≥ 익절가(target × (1+take_profit)) → 익절가 매도
+        ⑤ 그 외 → 종가 매도
+        (③④ 모두 도달 시 보수적으로 손절 우선 처리)
+    """
+    target, triggered = breakout_signals(df, k)
+    valid_prices = (target > 0) & (df["close"] > 0) & target.notna() & df["close"].notna()
+    triggered = triggered & valid_prices
+
+    # 추세 필터: 시가가 직전 ma_window일 종가 이동평균 위
+    ma = df["close"].shift(1).rolling(ma_window).mean()
+    trend_ok = (df["open"] >= ma).fillna(False)
+    triggered = triggered & trend_ok
+
+    tp_price = target * (1 + take_profit)
+    sl_price = target * (1 - stop_loss)
+
+    hit_sl = triggered & (df["low"] <= sl_price)
+    hit_tp = triggered & (df["high"] >= tp_price) & ~hit_sl
+    hit_close = triggered & ~hit_sl & ~hit_tp
+
+    exit_price = pd.Series(np.nan, index=df.index, dtype=float)
+    exit_price[hit_sl] = sl_price[hit_sl]
+    exit_price[hit_tp] = tp_price[hit_tp]
+    exit_price[hit_close] = df["close"][hit_close]
+
+    eff_entry = target * (1 + SLIPPAGE) * (1 + BUY_COST)
+    eff_exit = exit_price * (1 - SLIPPAGE) * (1 - SELL_COST)
+
+    daily_ret = pd.Series(0.0, index=df.index)
+    raw = (eff_exit[triggered] / eff_entry[triggered]) - 1.0
+    raw = raw.clip(lower=-0.5, upper=0.5)
+    raw = raw.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    daily_ret.loc[triggered] = raw
+
+    equity = capital * (1 + daily_ret).cumprod()
+    n_trades = int(triggered.sum())
+    wins = int((daily_ret[triggered] > 0).sum())
+    win_rate = wins / n_trades if n_trades else 0.0
+    total_return = equity.iloc[-1] / capital - 1
+    mdd = (equity / equity.cummax() - 1).min()
+
+    return {
+        "equity": equity,
+        "daily_return": daily_ret,
+        "triggered": triggered,
+        "total_return": float(total_return),
+        "mdd": float(mdd),
+        "win_rate": float(win_rate),
+        "trades": n_trades,
+        "tp_count": int(hit_tp.sum()),
+        "sl_count": int(hit_sl.sum()),
+        "close_count": int(hit_close.sum()),
+    }
+
+
 def run_buy_and_hold(df: pd.DataFrame, capital: float) -> pd.Series:
     """첫날 시가 매수 → 마지막 날 종가 매도 (수수료·슬리피지 반영)."""
     entry_price = df["open"].iloc[0] * (1 + SLIPPAGE) * (1 + BUY_COST)
@@ -197,26 +274,45 @@ def main() -> None:
     cap_per_stock = INITIAL_CAPITAL / n
 
     per_rows: list[dict] = []
-    portfolios: dict[float, pd.Series] = {}
+    portfolios_basic: dict[float, pd.Series] = {}
+    portfolios_enhanced: dict[float, pd.Series] = {}
 
     for k in K_VALUES:
-        portfolio_eq: pd.Series | None = None
+        eq_basic_total: pd.Series | None = None
+        eq_enh_total: pd.Series | None = None
         for ticker, df in data.items():
-            res = run_breakout(df, k, cap_per_stock)
-            vbt_extra = vbt_stats_from_returns(res["daily_return"], cap_per_stock)
+            res_b = run_breakout(df, k, cap_per_stock)
+            res_e = run_breakout_enhanced(df, k, cap_per_stock)
+            vbt_b = vbt_stats_from_returns(res_b["daily_return"], cap_per_stock)
+            vbt_e = vbt_stats_from_returns(res_e["daily_return"], cap_per_stock)
             per_rows.append({
-                "ticker": ticker,
-                "name": TICKERS[ticker],
-                "K": k,
-                "total_return_%": round(res["total_return"] * 100, 2),
-                "mdd_%": round(res["mdd"] * 100, 2),
-                "win_rate_%": round(res["win_rate"] * 100, 2),
-                "trades": res["trades"],
-                "vbt_sharpe": round(vbt_extra["vbt_sharpe"], 3),
+                "strategy": "basic",
+                "ticker": ticker, "name": TICKERS[ticker], "K": k,
+                "total_return_%": round(res_b["total_return"] * 100, 2),
+                "mdd_%": round(res_b["mdd"] * 100, 2),
+                "win_rate_%": round(res_b["win_rate"] * 100, 2),
+                "trades": res_b["trades"],
+                "tp_count": "-", "sl_count": "-", "close_count": "-",
+                "vbt_sharpe": round(vbt_b["vbt_sharpe"], 3),
             })
-            eq = res["equity"]
-            portfolio_eq = eq if portfolio_eq is None else portfolio_eq.add(eq, fill_value=0)
-        portfolios[k] = portfolio_eq
+            per_rows.append({
+                "strategy": "enhanced",
+                "ticker": ticker, "name": TICKERS[ticker], "K": k,
+                "total_return_%": round(res_e["total_return"] * 100, 2),
+                "mdd_%": round(res_e["mdd"] * 100, 2),
+                "win_rate_%": round(res_e["win_rate"] * 100, 2),
+                "trades": res_e["trades"],
+                "tp_count": res_e["tp_count"],
+                "sl_count": res_e["sl_count"],
+                "close_count": res_e["close_count"],
+                "vbt_sharpe": round(vbt_e["vbt_sharpe"], 3),
+            })
+            eq_basic_total = res_b["equity"] if eq_basic_total is None \
+                else eq_basic_total.add(res_b["equity"], fill_value=0)
+            eq_enh_total = res_e["equity"] if eq_enh_total is None \
+                else eq_enh_total.add(res_e["equity"], fill_value=0)
+        portfolios_basic[k] = eq_basic_total
+        portfolios_enhanced[k] = eq_enh_total
 
     # Buy & hold portfolio
     bh_equity: pd.Series | None = None
@@ -225,23 +321,22 @@ def main() -> None:
         bh_equity = eq if bh_equity is None else bh_equity.add(eq, fill_value=0)
 
     # Per-stock × K table
-    df_per = pd.DataFrame(per_rows).sort_values(["K", "ticker"]).reset_index(drop=True)
+    df_per = pd.DataFrame(per_rows).sort_values(["strategy", "K", "ticker"]).reset_index(drop=True)
 
     # Portfolio summary
-    summary_rows: list[dict] = []
-    for k, eq in portfolios.items():
-        summary_rows.append({
-            "strategy": f"VolatilityBreakout K={k}",
+    def stats(eq: pd.Series) -> dict:
+        return {
             "final_value": round(float(eq.iloc[-1]), 0),
             "total_return_%": round(eq.iloc[-1] / INITIAL_CAPITAL * 100 - 100, 2),
             "mdd_%": round(float((eq / eq.cummax() - 1).min()) * 100, 2),
-        })
-    summary_rows.append({
-        "strategy": "Buy&Hold (equal weight)",
-        "final_value": round(float(bh_equity.iloc[-1]), 0),
-        "total_return_%": round(bh_equity.iloc[-1] / INITIAL_CAPITAL * 100 - 100, 2),
-        "mdd_%": round(float((bh_equity / bh_equity.cummax() - 1).min()) * 100, 2),
-    })
+        }
+
+    summary_rows: list[dict] = []
+    for k, eq in portfolios_basic.items():
+        summary_rows.append({"strategy": f"Basic K={k}", **stats(eq)})
+    for k, eq in portfolios_enhanced.items():
+        summary_rows.append({"strategy": f"Enhanced K={k} (MA{MA_WINDOW}+TP{int(TAKE_PROFIT*100)}%/SL{int(STOP_LOSS*100)}%)", **stats(eq)})
+    summary_rows.append({"strategy": "Buy&Hold (equal weight)", **stats(bh_equity)})
     df_summary = pd.DataFrame(summary_rows)
 
     # Save outputs
@@ -250,17 +345,22 @@ def main() -> None:
     df_per.to_csv(per_csv, index=False, encoding="utf-8-sig")
     df_summary.to_csv(sum_csv, index=False, encoding="utf-8-sig")
 
-    # Equity curve chart
+    # Equity curve chart — basic vs enhanced vs buy&hold
     fig, ax = plt.subplots(figsize=(12, 6))
-    for k, eq in portfolios.items():
-        ax.plot(eq.index, eq.values, label=f"VolBreakout K={k}", linewidth=1.5)
+    colors_b = {0.3: "#1f77b4", 0.5: "#ff7f0e", 0.7: "#2ca02c"}
+    for k, eq in portfolios_basic.items():
+        ax.plot(eq.index, eq.values, color=colors_b[k], alpha=0.5,
+                linestyle=":", linewidth=1.2, label=f"Basic K={k}")
+    for k, eq in portfolios_enhanced.items():
+        ax.plot(eq.index, eq.values, color=colors_b[k],
+                linewidth=1.8, label=f"Enhanced K={k}")
     ax.plot(bh_equity.index, bh_equity.values, "--", color="black",
-            label="Buy & Hold", linewidth=1.5)
+            linewidth=1.5, label="Buy & Hold")
     ax.axhline(INITIAL_CAPITAL, color="gray", linestyle=":", linewidth=1)
-    ax.set_title("Volatility Breakout vs Buy & Hold — Equity Curves")
+    ax.set_title("Volatility Breakout — Basic vs Enhanced (MA filter + TP/SL) vs Buy & Hold")
     ax.set_xlabel("Date")
     ax.set_ylabel("Portfolio Value (KRW)")
-    ax.legend(loc="best")
+    ax.legend(loc="best", ncol=2, fontsize=9)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     chart_path = RESULTS_DIR / "equity_curves.png"
@@ -269,12 +369,12 @@ def main() -> None:
 
     # Drawdown chart
     fig2, ax2 = plt.subplots(figsize=(12, 4))
-    for k, eq in portfolios.items():
+    for k, eq in portfolios_enhanced.items():
         dd = eq / eq.cummax() - 1
-        ax2.plot(dd.index, dd.values * 100, label=f"K={k}")
+        ax2.plot(dd.index, dd.values * 100, color=colors_b[k], label=f"Enhanced K={k}")
     bh_dd = bh_equity / bh_equity.cummax() - 1
     ax2.plot(bh_dd.index, bh_dd.values * 100, "--", color="black", label="Buy & Hold")
-    ax2.set_title("Drawdown (%)")
+    ax2.set_title("Drawdown (%) — Enhanced strategies vs Buy & Hold")
     ax2.set_ylabel("Drawdown (%)")
     ax2.grid(True, alpha=0.3)
     ax2.legend(loc="best")
@@ -284,13 +384,14 @@ def main() -> None:
     plt.close(fig2)
 
     # Console output
-    pd.set_option("display.width", 140)
+    pd.set_option("display.width", 160)
     pd.set_option("display.max_columns", None)
-    print("\n=== 종목 × K 값별 결과 ===")
+    print("\n=== 종목 × K 값별 결과 (basic vs enhanced) ===")
     print(df_per.to_string(index=False))
     print("\n=== 포트폴리오 요약 (초기 자본 1천만원, 1/N) ===")
     print(df_summary.to_string(index=False))
-    print(f"\n저장: {per_csv}, {sum_csv}, {chart_path}, {dd_path}")
+    print(f"\n파라미터: MA{MA_WINDOW}, TP=+{TAKE_PROFIT*100:.0f}%, SL=−{STOP_LOSS*100:.0f}%")
+    print(f"저장: {per_csv}, {sum_csv}, {chart_path}, {dd_path}")
 
 
 if __name__ == "__main__":
