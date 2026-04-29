@@ -49,7 +49,11 @@ def fetch_pykrx(ticker: str, start: str, end: str) -> pd.DataFrame:
 
     s = start.replace("-", "")
     e = end.replace("-", "")
-    df = stock.get_market_ohlcv_by_date(s, e, ticker)
+    # adjusted=True: 액면분할/유상증자/배당 등이 반영된 수정주가
+    try:
+        df = stock.get_market_ohlcv_by_date(s, e, ticker, adjusted=True)
+    except TypeError:
+        df = stock.get_market_ohlcv_by_date(s, e, ticker)
     if df is None or df.empty:
         raise RuntimeError(f"pykrx returned no data for {ticker}")
     df = df.rename(
@@ -122,11 +126,19 @@ def run_breakout(df: pd.DataFrame, k: float, capital: float) -> dict:
     실효 진입가/청산가를 계산한 뒤 일별 수익률로 변환한다.
     """
     target, triggered = breakout_signals(df, k)
+    # 가격 데이터 이상치(0/음수/NaN) 방어 — 거래 자체에서 제외
+    valid_prices = (target > 0) & (df["close"] > 0) & target.notna() & df["close"].notna()
+    triggered = triggered & valid_prices
+
     eff_entry = target * (1 + SLIPPAGE) * (1 + BUY_COST)
     eff_exit = df["close"] * (1 - SLIPPAGE) * (1 - SELL_COST)
 
     daily_ret = pd.Series(0.0, index=df.index)
-    daily_ret.loc[triggered] = (eff_exit[triggered] / eff_entry[triggered]) - 1.0
+    raw = (eff_exit[triggered] / eff_entry[triggered]) - 1.0
+    # 비정상적 단일일 수익률(액면분할 잔재 등) 캡: ±50%
+    raw = raw.clip(lower=-0.5, upper=0.5)
+    raw = raw.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    daily_ret.loc[triggered] = raw
 
     equity = capital * (1 + daily_ret).cumprod()
 
