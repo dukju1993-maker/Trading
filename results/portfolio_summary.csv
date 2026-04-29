@@ -1,0 +1,5 @@
+﻿strategy,final_value,total_return_%,mdd_%
+VolatilityBreakout K=0.3,514713.0,-94.85,-94.85
+VolatilityBreakout K=0.5,153069.0,-98.47,-98.47
+VolatilityBreakout K=0.7,169481.0,-98.31,-98.31
+Buy&Hold (equal weight),17542925.0,75.43,-31.94

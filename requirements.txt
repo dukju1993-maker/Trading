@@ -1,0 +1,5 @@
+pykrx>=1.0.45
+vectorbt>=0.25
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
