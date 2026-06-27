@@ -44,6 +44,11 @@ MA_WINDOW = 5           # 5일 이동평균 추세 필터
 TAKE_PROFIT = 0.05      # +5% 익절
 STOP_LOSS = 0.03        # −3% 손절
 
+# ATR Trailing Stop 파라미터
+ATR_PERIOD = 14         # ATR 계산 기간
+ATR_SL_MULT = 1.5       # trailing SL = 당일 고점 − ATR × 1.5
+ATR_TP_MULT = 2.0       # TP = 진입가 + ATR × 2.0
+
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 
@@ -112,6 +117,16 @@ def load_prices(use_demo: bool) -> dict[str, pd.DataFrame]:
                   file=sys.stderr)
             data[ticker] = synthesize(ticker, START_DATE, END_DATE)
     return data
+
+
+# ---------------------------------------------------------------------------
+# Strategy helpers
+# ---------------------------------------------------------------------------
+def compute_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
+    """Wilder 지수이동평균 기반 ATR."""
+    h, l, c_prev = df["high"], df["low"], df["close"].shift(1)
+    tr = pd.concat([(h - l), (h - c_prev).abs(), (l - c_prev).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +251,75 @@ def run_breakout_enhanced(
     }
 
 
+def run_breakout_atr_trailing(
+    df: pd.DataFrame,
+    k: float,
+    capital: float,
+    ma_window: int = MA_WINDOW,
+    atr_period: int = ATR_PERIOD,
+    sl_mult: float = ATR_SL_MULT,
+    tp_mult: float = ATR_TP_MULT,
+) -> dict:
+    """ATR 기반 추적 손절(Trailing Stop) + 추세 필터 변동성 돌파 전략.
+
+    매수 조건 (모두 충족):
+        ① 당일 고가 ≥ 매수 기준가 (변동성 돌파)
+        ② 당일 시가 ≥ 직전 ma_window일 이동평균 (추세 필터)
+
+    청산 (OHLC 근사, 우선순위):
+        ③ trailing SL: 당일 저가 ≤ 당일 고가 − ATR × sl_mult → 손절
+           (고점이 올라갈수록 SL선도 상향되는 trailing 효과)
+        ④ TP: 당일 고가 ≥ 진입가 + ATR × tp_mult  (③ 미해당 시)
+        ⑤ 그 외 → 종가 매도
+    """
+    atr = compute_atr(df, atr_period)
+    target, triggered = breakout_signals(df, k)
+    valid = (target > 0) & (df["close"] > 0) & target.notna() & df["close"].notna() & atr.notna()
+    triggered = triggered & valid
+
+    ma = df["close"].shift(1).rolling(ma_window).mean()
+    trend_ok = (df["open"] >= ma).fillna(False)
+    triggered = triggered & trend_ok
+
+    tp_price = target + atr * tp_mult
+    trailing_sl = df["high"] - atr * sl_mult
+
+    hit_sl = triggered & (df["low"] <= trailing_sl)
+    hit_tp = triggered & (df["high"] >= tp_price) & ~hit_sl
+    hit_close = triggered & ~hit_sl & ~hit_tp
+
+    exit_price = pd.Series(np.nan, index=df.index, dtype=float)
+    exit_price[hit_sl] = trailing_sl[hit_sl].clip(lower=0)
+    exit_price[hit_tp] = tp_price[hit_tp]
+    exit_price[hit_close] = df["close"][hit_close]
+
+    eff_entry = target * (1 + SLIPPAGE) * (1 + BUY_COST)
+    eff_exit = exit_price * (1 - SLIPPAGE) * (1 - SELL_COST)
+
+    daily_ret = pd.Series(0.0, index=df.index)
+    raw = (eff_exit[triggered] / eff_entry[triggered]) - 1.0
+    raw = raw.clip(lower=-0.5, upper=0.5).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    daily_ret.loc[triggered] = raw
+
+    equity = capital * (1 + daily_ret).cumprod()
+    n_trades = int(triggered.sum())
+    wins = int((daily_ret[triggered] > 0).sum())
+    win_rate = wins / n_trades if n_trades else 0.0
+
+    return {
+        "equity": equity,
+        "daily_return": daily_ret,
+        "triggered": triggered,
+        "total_return": float(equity.iloc[-1] / capital - 1),
+        "mdd": float((equity / equity.cummax() - 1).min()),
+        "win_rate": float(win_rate),
+        "trades": n_trades,
+        "tp_count": int(hit_tp.sum()),
+        "sl_count": int(hit_sl.sum()),
+        "close_count": int(hit_close.sum()),
+    }
+
+
 def run_buy_and_hold(df: pd.DataFrame, capital: float) -> pd.Series:
     """첫날 시가 매수 → 마지막 날 종가 매도 (수수료·슬리피지 반영)."""
     entry_price = df["open"].iloc[0] * (1 + SLIPPAGE) * (1 + BUY_COST)
@@ -276,43 +360,48 @@ def main() -> None:
     per_rows: list[dict] = []
     portfolios_basic: dict[float, pd.Series] = {}
     portfolios_enhanced: dict[float, pd.Series] = {}
+    portfolios_atr: dict[float, pd.Series] = {}
 
     for k in K_VALUES:
         eq_basic_total: pd.Series | None = None
         eq_enh_total: pd.Series | None = None
+        eq_atr_total: pd.Series | None = None
         for ticker, df in data.items():
             res_b = run_breakout(df, k, cap_per_stock)
             res_e = run_breakout_enhanced(df, k, cap_per_stock)
+            res_a = run_breakout_atr_trailing(df, k, cap_per_stock)
             vbt_b = vbt_stats_from_returns(res_b["daily_return"], cap_per_stock)
             vbt_e = vbt_stats_from_returns(res_e["daily_return"], cap_per_stock)
-            per_rows.append({
-                "strategy": "basic",
-                "ticker": ticker, "name": TICKERS[ticker], "K": k,
-                "total_return_%": round(res_b["total_return"] * 100, 2),
-                "mdd_%": round(res_b["mdd"] * 100, 2),
-                "win_rate_%": round(res_b["win_rate"] * 100, 2),
-                "trades": res_b["trades"],
-                "tp_count": "-", "sl_count": "-", "close_count": "-",
-                "vbt_sharpe": round(vbt_b["vbt_sharpe"], 3),
-            })
-            per_rows.append({
-                "strategy": "enhanced",
-                "ticker": ticker, "name": TICKERS[ticker], "K": k,
-                "total_return_%": round(res_e["total_return"] * 100, 2),
-                "mdd_%": round(res_e["mdd"] * 100, 2),
-                "win_rate_%": round(res_e["win_rate"] * 100, 2),
-                "trades": res_e["trades"],
-                "tp_count": res_e["tp_count"],
-                "sl_count": res_e["sl_count"],
-                "close_count": res_e["close_count"],
-                "vbt_sharpe": round(vbt_e["vbt_sharpe"], 3),
-            })
+            vbt_a = vbt_stats_from_returns(res_a["daily_return"], cap_per_stock)
+
+            def _row(strategy, res, vbt_extra) -> dict:
+                return {
+                    "strategy": strategy,
+                    "ticker": ticker, "name": TICKERS[ticker], "K": k,
+                    "total_return_%": round(res["total_return"] * 100, 2),
+                    "mdd_%": round(res["mdd"] * 100, 2),
+                    "win_rate_%": round(res["win_rate"] * 100, 2),
+                    "trades": res["trades"],
+                    "tp_count": res.get("tp_count", "-"),
+                    "sl_count": res.get("sl_count", "-"),
+                    "close_count": res.get("close_count", "-"),
+                    "vbt_sharpe": round(vbt_extra["vbt_sharpe"], 3),
+                }
+
+            per_rows.append(_row("basic", res_b, vbt_b))
+            per_rows.append(_row("enhanced", res_e, vbt_e))
+            per_rows.append(_row("atr_trailing", res_a, vbt_a))
+
             eq_basic_total = res_b["equity"] if eq_basic_total is None \
                 else eq_basic_total.add(res_b["equity"], fill_value=0)
             eq_enh_total = res_e["equity"] if eq_enh_total is None \
                 else eq_enh_total.add(res_e["equity"], fill_value=0)
+            eq_atr_total = res_a["equity"] if eq_atr_total is None \
+                else eq_atr_total.add(res_a["equity"], fill_value=0)
+
         portfolios_basic[k] = eq_basic_total
         portfolios_enhanced[k] = eq_enh_total
+        portfolios_atr[k] = eq_atr_total
 
     # Buy & hold portfolio
     bh_equity: pd.Series | None = None
@@ -336,6 +425,8 @@ def main() -> None:
         summary_rows.append({"strategy": f"Basic K={k}", **stats(eq)})
     for k, eq in portfolios_enhanced.items():
         summary_rows.append({"strategy": f"Enhanced K={k} (MA{MA_WINDOW}+TP{int(TAKE_PROFIT*100)}%/SL{int(STOP_LOSS*100)}%)", **stats(eq)})
+    for k, eq in portfolios_atr.items():
+        summary_rows.append({"strategy": f"ATR_Trailing K={k} (SL×{ATR_SL_MULT}/TP×{ATR_TP_MULT})", **stats(eq)})
     summary_rows.append({"strategy": "Buy&Hold (equal weight)", **stats(bh_equity)})
     df_summary = pd.DataFrame(summary_rows)
 
@@ -345,39 +436,47 @@ def main() -> None:
     df_per.to_csv(per_csv, index=False, encoding="utf-8-sig")
     df_summary.to_csv(sum_csv, index=False, encoding="utf-8-sig")
 
-    # Equity curve chart — basic vs enhanced vs buy&hold
-    fig, ax = plt.subplots(figsize=(12, 6))
+    # Equity curve chart — basic vs enhanced vs atr_trailing vs buy&hold
+    fig, ax = plt.subplots(figsize=(14, 7))
     colors_b = {0.3: "#1f77b4", 0.5: "#ff7f0e", 0.7: "#2ca02c"}
     for k, eq in portfolios_basic.items():
-        ax.plot(eq.index, eq.values, color=colors_b[k], alpha=0.5,
-                linestyle=":", linewidth=1.2, label=f"Basic K={k}")
+        ax.plot(eq.index, eq.values, color=colors_b[k], alpha=0.35,
+                linestyle=":", linewidth=1.0, label=f"Basic K={k}")
     for k, eq in portfolios_enhanced.items():
+        ax.plot(eq.index, eq.values, color=colors_b[k], alpha=0.7,
+                linestyle="--", linewidth=1.4, label=f"Enhanced K={k}")
+    for k, eq in portfolios_atr.items():
         ax.plot(eq.index, eq.values, color=colors_b[k],
-                linewidth=1.8, label=f"Enhanced K={k}")
-    ax.plot(bh_equity.index, bh_equity.values, "--", color="black",
-            linewidth=1.5, label="Buy & Hold")
+                linewidth=2.0, label=f"ATR_Trailing K={k}")
+    ax.plot(bh_equity.index, bh_equity.values, "-", color="black",
+            linewidth=2.0, label="Buy & Hold")
     ax.axhline(INITIAL_CAPITAL, color="gray", linestyle=":", linewidth=1)
-    ax.set_title("Volatility Breakout — Basic vs Enhanced (MA filter + TP/SL) vs Buy & Hold")
+    ax.set_title("Volatility Breakout — Basic / Enhanced / ATR Trailing vs Buy & Hold")
     ax.set_xlabel("Date")
     ax.set_ylabel("Portfolio Value (KRW)")
-    ax.legend(loc="best", ncol=2, fontsize=9)
+    ax.legend(loc="best", ncol=3, fontsize=8)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     chart_path = RESULTS_DIR / "equity_curves.png"
     fig.savefig(chart_path, dpi=120)
     plt.close(fig)
 
-    # Drawdown chart
-    fig2, ax2 = plt.subplots(figsize=(12, 4))
-    for k, eq in portfolios_enhanced.items():
-        dd = eq / eq.cummax() - 1
-        ax2.plot(dd.index, dd.values * 100, color=colors_b[k], label=f"Enhanced K={k}")
-    bh_dd = bh_equity / bh_equity.cummax() - 1
-    ax2.plot(bh_dd.index, bh_dd.values * 100, "--", color="black", label="Buy & Hold")
-    ax2.set_title("Drawdown (%) — Enhanced strategies vs Buy & Hold")
-    ax2.set_ylabel("Drawdown (%)")
-    ax2.grid(True, alpha=0.3)
-    ax2.legend(loc="best")
+    # Drawdown chart — enhanced vs atr_trailing vs buy&hold
+    fig2, axes = plt.subplots(1, 2, figsize=(14, 4), sharey=True)
+    for ax2, (portfolios, title) in zip(
+        axes,
+        [(portfolios_enhanced, f"Enhanced (fixed TP{int(TAKE_PROFIT*100)}%/SL{int(STOP_LOSS*100)}%)"),
+         (portfolios_atr, f"ATR Trailing (SL×{ATR_SL_MULT}/TP×{ATR_TP_MULT})")],
+    ):
+        for k, eq in portfolios.items():
+            dd = eq / eq.cummax() - 1
+            ax2.plot(dd.index, dd.values * 100, color=colors_b[k], label=f"K={k}")
+        bh_dd = bh_equity / bh_equity.cummax() - 1
+        ax2.plot(bh_dd.index, bh_dd.values * 100, "--", color="black", label="Buy & Hold")
+        ax2.set_title(f"Drawdown (%) — {title}")
+        ax2.set_ylabel("Drawdown (%)")
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc="best", fontsize=8)
     fig2.tight_layout()
     dd_path = RESULTS_DIR / "drawdown.png"
     fig2.savefig(dd_path, dpi=120)
@@ -386,11 +485,12 @@ def main() -> None:
     # Console output
     pd.set_option("display.width", 160)
     pd.set_option("display.max_columns", None)
-    print("\n=== 종목 × K 값별 결과 (basic vs enhanced) ===")
+    print("\n=== 종목 × K 값별 결과 (basic / enhanced / atr_trailing) ===")
     print(df_per.to_string(index=False))
     print("\n=== 포트폴리오 요약 (초기 자본 1천만원, 1/N) ===")
     print(df_summary.to_string(index=False))
-    print(f"\n파라미터: MA{MA_WINDOW}, TP=+{TAKE_PROFIT*100:.0f}%, SL=−{STOP_LOSS*100:.0f}%")
+    print(f"\n파라미터 — Enhanced: MA{MA_WINDOW}, TP=+{TAKE_PROFIT*100:.0f}%, SL=−{STOP_LOSS*100:.0f}%")
+    print(f"파라미터 — ATR Trailing: ATR{ATR_PERIOD}일, SL×{ATR_SL_MULT}, TP×{ATR_TP_MULT}")
     print(f"저장: {per_csv}, {sum_csv}, {chart_path}, {dd_path}")
 
 
